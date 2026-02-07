@@ -1,47 +1,72 @@
-import asyncio
-import websockets
 import os
-import http.server
-import threading
+from aiohttp import web, WSMsgType
+import asyncio
 
-# --- CONFIG ---
-PORT = int(os.environ.get("PORT", 8080))
+# Хранилище активных соединений
+village_ws = None
+web_conns = {}
 
-# Простейший HTTP сервер для "обмана" Render (Health Check)
-class HealthCheckHandler(http.server.SimpleHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Nexus Tunnel is Running")
+async def handle_control(request):
+    """Управляющее соединение (для твоего bridge.py)"""
+    global village_client
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    
+    village_client = ws
+    print("[+] Мост из деревни подключен")
+    
+    try:
+        async for msg in ws:
+            if msg.type == WSMsgType.BINARY:
+                data = msg.data
+                if data.startswith(b"DATA:"):
+                    parts = data.split(b":", 2)
+                    conn_id = parts[1].decode()
+                    if conn_id in web_conns:
+                        await web_conns[conn_id].send_bytes(parts[2])
+    finally:
+        village_client = None
+        print("[-] Мост отключен")
+    return ws
 
-def run_health_check():
-    server = http.server.HTTPServer(('0.0.0.0', PORT), HealthCheckHandler)
-    server.serve_forever()
+async def handle_public(request):
+    """Входящие соединения (для твоей ратки)"""
+    global village_client
+    if not village_client:
+        return web.Response(status=503, text="Tunnel Offline")
 
-# --- WEBSOCKET LOGIC ---
-async def tunnel_logic(websocket, path):
-    # Тот же код, что я давал раньше
-    if path == "/control":
-        print("[+] Деревня подключена")
-        try:
-            async for message in websocket:
-                # Обработка трафика ратки
-                pass
-        except: pass
-    else:
-        await websocket.close()
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    
+    import uuid
+    conn_id = str(uuid.uuid4())[:8]
+    web_conns[conn_id] = ws
+    
+    print(f"[*] Новое соединение [{conn_id}]")
+    await village_client.send_str(f"OPEN:{conn_id}")
 
-async def main():
-    # Запускаем WebSocket на том же порту (некоторые хостинги не дают два порта)
-    # Если Render не пускает, придется использовать библиотеку 'aiohttp'
-    async with websockets.serve(tunnel_logic, "0.0.0.0", PORT + 1): 
-        print(f"WS Tunnel started on {PORT + 1}")
-        await asyncio.Future()
+    try:
+        async for msg in ws:
+            if msg.type in (WSMsgType.BINARY, WSMsgType.TEXT):
+                payload = msg.data if isinstance(msg.data, bytes) else msg.data.encode()
+                packet = f"DATA:{conn_id}:".encode() + payload
+                await village_client.send_bytes(packet)
+    finally:
+        if village_client:
+            await village_client.send_str(f"CLOSE:{conn_id}")
+        web_conns.pop(conn_id, None)
+    return ws
+
+async def health_check(request):
+    return web.Response(text="Nexus Tunnel is Live")
+
+app = web.Application()
+app.add_routes([
+    web.get('/control', handle_control), # Сюда вешаем bridge.py
+    web.get('/', health_check),          # Это для Render (Health Check)
+    web.get('/{tail:.*}', handle_public) # Всё остальное — трафик для ратки
+])
 
 if __name__ == "__main__":
-    # Запускаем проверку здоровья в отдельном потоке
-    threading.Thread(target=run_health_check, daemon=True).start()
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    port = int(os.environ.get("PORT", 8080))
+    web.run_app(app, host='0.0.0.0', port=port)
